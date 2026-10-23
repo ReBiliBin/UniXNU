@@ -1,6 +1,9 @@
 name: macOS build
 
 on:
+  push:
+    branches:
+      - codex/validate-qemu-ci-39954206945
   workflow_dispatch:
     inputs:
       device_repository:
@@ -82,11 +85,11 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 360
     env:
-      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode || '26.6' }}.app/Contents/Developer
       UNIXNU_DEVICE: ${{ github.workspace }}/device
       UNIXNU_IPSW: ${{ inputs.ipsw_url }}
-      DEFCONFIG: ${{ inputs.defconfig }}
-      STEPS: ${{ inputs.steps }}
+      DEFCONFIG: ${{ inputs.defconfig || 'qemu_defconfig' }}
+      STEPS: ${{ inputs.steps || 'kernel' }}
     steps:
       - name: Check out UniXNU
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -96,8 +99,8 @@ jobs:
       - name: Check out the device repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ inputs.device_repository }}
-          ref: ${{ inputs.device_ref }}
+          repository: ${{ inputs.device_repository || 'xVanTuring/UniXNU-qemu' }}
+          ref: ${{ inputs.device_ref || '97b75b1f63c6b7e895cd7646029db741d5fe5488' }}
           path: device
           token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
 
