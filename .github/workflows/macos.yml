@@ -161,8 +161,8 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos --find mig
-          clang --version | head -n 1
-          "$(brew --prefix llvm)/bin/clang" --version | head -n 1
+          clang --version | sed -n '1p'
+          "$(brew --prefix llvm)/bin/clang" --version | sed -n '1p'
           python3 --version
           missing=0
           for tool in git make clang cmake ninja unifdef ld.lld mformat mcopy dtc xcodebuild; do
@@ -174,7 +174,30 @@ jobs:
           exit "$missing"
 
       - name: Select the device
-        run: ./unixnu defconfig "$DEFCONFIG"
+        run: |
+          ./unixnu defconfig "$DEFCONFIG"
+          # The pinned QEMU defconfig predates the archive-builder opt-in.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+          from scripts.unixnu.config import parse_config
+          
+          if os.environ["DEFCONFIG"] == "qemu_defconfig":
+              device = Path(os.environ["UNIXNU_DEVICE"])
+              board = tomllib.loads((device / "board.toml").read_text())
+              if board.get("board", {}).get("name") == "qemu":
+                  path = Path("out/qemu/.config")
+                  text = path.read_text()
+                  config = parse_config(text)
+                  # Respect an explicit setting in a newer or customized device configuration.
+                  if (config.get("XNU_SOURCE_CORECRYPTO14")
+                          and config.get("XNU_SOURCE_PTHREAD")
+                          and "XNU_BUILD_ARCHIVES" not in config):
+                      separator = "" if text.endswith("\n") else "\n"
+                      path.write_text(text + separator + "CONFIG_XNU_BUILD_ARCHIVES=y\n")
+                      print("QEMU compatibility: enabled declared archive builders")
+          PY
 
       - name: Prepare inputs
         if: contains(inputs.steps, 'payload')
@@ -302,7 +325,7 @@ jobs:
             echo "| payload | ${PAYLOAD:-skipped} |"
             echo
             echo "This workflow only checks that the build works. It publishes text logs (7 days) and no images."
-            xcodebuild -version | head -n 1
+            xcodebuild -version | sed -n '1p'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove proprietary inputs
