@@ -239,6 +239,117 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: ./unixnu build kernel
 
+      - name: Install QEMU host tools
+        if: env.DEFCONFIG == 'qemu_defconfig' && steps.check.outputs.board == 'qemu'
+        timeout-minutes: 10
+        run: |
+          brew install qemu
+          sysctl hw.memsize hw.ncpu
+          qemu-system-aarch64 --version
+
+      - name: Build PMGR bridge from the kernel candidate
+        id: kernel_bridge
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        if: env.DEFCONFIG == 'qemu_defconfig' && steps.check.outputs.board == 'qemu'
+        timeout-minutes: 15
+        run: |
+          ./unixnu build kernel
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path("out/qemu/logs/archive-10-build-platform-power.log").read_text()
+          assert "PASS: ordinary ARM64/iOS17 build; exact native and original bindings" in text, text
+          print("PASS: PMGR bridge uses qualified bindings instead of the first-pass stub")
+          PY
+
+      - name: Build QEMU firmware and payload
+        id: qemu_payload
+        if: env.DEFCONFIG == 'qemu_defconfig' && steps.check.outputs.board == 'qemu'
+        timeout-minutes: 20
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          export UNIXNU_QEMU_ACCEL=tcg
+          export UNIXNU_UEFI="$GITHUB_WORKSPACE/qemu-font"
+          font_dir="$UNIXNU_UEFI/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib"
+          mkdir -p "$font_dir"
+          curl -fsSL --retry 3 --max-time 90 \
+            https://raw.githubusercontent.com/UniXNU/uefi-sheng/0eb4514db0744b8136a3897ab1af93b713c2c27b/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h \
+            -o "$font_dir/Font.h"
+          test "$(git hash-object "$font_dir/Font.h")" = 2ea15a28fe1ad2ddddf1cbbac766aeceb9243183
+          # This public seed identifies only the synthetic VM, never a physical phone.
+          ./unixnu build package payload --unique-chip-id 0123456789abcdef
+
+      - name: Validate native XNU user process with TCG
+        id: native_user
+        if: env.DEFCONFIG == 'qemu_defconfig' && steps.check.outputs.board == 'qemu'
+        timeout-minutes: 10
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          /usr/bin/time -l python3 out/qemu/tree/scripts/run-qemu.py \
+            --native-user --accel tcg --display none \
+            --screen firmware --seconds 300 --every 60 \
+            2>&1 | tee out/qemu/logs/native-user-run.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          log = Path("out/qemu/logs/native-user-run.log").read_text()
+          pattern = r"native user: PC ([0-9a-fA-F]+) \(checkpoint ([0-9a-fA-F]+)\), EL(\d+), getpid (\d+), sysctl status (-?\d+), hw.pagesize (\d+)"
+          match = re.search(pattern, log)
+          if not match:
+              raise SystemExit("FAIL: no native-user register/syscall observation was produced")
+          pc, checkpoint = (int(value, 16) for value in match.group(1, 2))
+          el, pid, status, page_size = (int(value) for value in match.group(3, 4, 5, 6))
+          addresses = json.loads(Path("out/qemu/tree/build/native-user-fixture/addresses.json").read_text())
+          expected = int(addresses["_checkpoint"])
+          conditions = {
+              "pc_matches_fixture_checkpoint": pc == checkpoint == expected,
+              "user_exception_level": el == 0,
+              "pid_one": pid == 1,
+              "sysctl_success": status == 0,
+              "four_kib_pages": page_size == 4096,
+          }
+          record = {
+              "result": "PASS" if all(conditions.values()) else "FAIL",
+              "pc": hex(pc), "checkpoint": hex(checkpoint), "fixture_checkpoint": hex(expected),
+              "el": el, "getpid": pid, "sysctl_status": status, "hw_pagesize": page_size,
+              "conditions": conditions,
+              "scope": "Actual XNU mockfs static user process; no original iPadOS userland or UI",
+          }
+          Path("out/qemu/logs/native-user-check.log").write_text(json.dumps(record, indent=2) + "\n")
+          print(json.dumps(record, indent=2))
+          if not all(conditions.values()):
+              raise SystemExit("FAIL: native-user checkpoint requirements were not met")
+          PY
+
+      - name: Collect native observation text
+        if: always() && env.DEFCONFIG == 'qemu_defconfig' && steps.check.outputs.board == 'qemu'
+        timeout-minutes: 2
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          logs = Path("out/qemu/logs")
+          logs.mkdir(parents=True, exist_ok=True)
+          runs = sorted(path for path in Path("out/qemu/run").glob("*") if path.is_dir())
+          paths = list(runs[-1].iterdir()) if runs else []
+          fixture = Path("out/qemu/tree/build/native-user-fixture")
+          paths.extend(fixture / name for name in ("addresses.json", "trustcache.json"))
+          count = 0
+          for path in paths:
+              if not path.is_file() or path.suffix.lower() not in (".txt", ".log", ".json") or path.stat().st_size > 5_000_000:
+                  continue
+              data = path.read_bytes()
+              if b"\0" in data:
+                  continue
+              try:
+                  data.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+              (logs / ("qemu-native-" + path.name + ".log")).write_bytes(data)
+              count += 1
+          print(f"{count} native observation text files staged; no images or binaries")
+          PY
+
       - name: Build userdata
         id: userdata
         if: contains(inputs.steps, 'userdata')
@@ -317,6 +428,7 @@ jobs:
           KERNEL: ${{ steps.kernel.outcome }}
           USERDATA: ${{ steps.userdata.outcome }}
           PAYLOAD: ${{ steps.payload.outcome }}
+          NATIVE_USER: ${{ steps.native_user.outcome }}
         run: |
           {
             echo "## macOS build: ${BOARD:-unknown} (${DEFCONFIG}, ${STEPS})"
@@ -326,6 +438,7 @@ jobs:
             echo "| kernel | ${KERNEL:-skipped} |"
             echo "| userdata | ${USERDATA:-skipped} |"
             echo "| payload | ${PAYLOAD:-skipped} |"
+            echo "| native XNU user process | ${NATIVE_USER:-skipped} |"
             echo
             echo "This workflow only checks that the build works. It publishes text logs (7 days) and no images."
             xcodebuild -version | sed -n '1p'
