@@ -1,9 +1,6 @@
 name: macOS build
 
 on:
-  push:
-    branches:
-      - codex/validate-qemu-ci-39954206945
   workflow_dispatch:
     inputs:
       device_repository:
@@ -440,7 +437,7 @@ jobs:
             echo "| payload | ${PAYLOAD:-skipped} |"
             echo "| native XNU user process | ${NATIVE_USER:-skipped} |"
             echo
-            echo "This workflow only checks that the build works. It publishes text logs (7 days) and no images."
+            echo "This workflow checks the build and QEMU native-user execution. It publishes text logs (7 days) and no images. Original iPadOS userland/UI is not validated."
             xcodebuild -version | sed -n '1p'
           } >> "$GITHUB_STEP_SUMMARY"
 
