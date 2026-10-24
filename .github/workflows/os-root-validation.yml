@@ -71,6 +71,10 @@ jobs:
           qemu-system-aarch64 --version
           python3 audit/os-root/ci/ci-util.py install
 
+      - name: Check paused 8 GiB QEMU startup before compiling
+        timeout-minutes: 3
+        run: python3 audit/os-root/ci/probe-qemu-startup.py
+
       - name: Build source XNU baseline and exact PMGR bindings
         id: baseline_kernel
         timeout-minutes: 45

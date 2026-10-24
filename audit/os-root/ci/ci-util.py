@@ -40,6 +40,7 @@ def install(sync=False):
             'scripts/unixnu/config.py': '5e7f20aa885b4a1d3ebeab33c674cac0e3baa365',
             'scripts/build-owner-os-policy.py': 'd062ee1a0a895bcd6eb7bb1cf5c6c3793edd3cc4',
             'scripts/prepare-owner-data-fixture.py': 'a9dda5d4f6390c9e373b893359a8d124c16f49ad',
+            'scripts/qemu-entry/gdb-stop.py': '8e0efdb1951f0bf000f81efcb0ebf9a86fecfaf1',
         }
         actual = {name: subprocess.check_output(['git', 'rev-parse', 'HEAD:' + name], cwd=ROOT, text=True).strip()
                   for name in expected}
@@ -49,10 +50,12 @@ def install(sync=False):
         save('source-identity.json', {'main_experiment_commit': head, 'main_baseline_blobs': actual, 'device_commit': DEVICE_PIN})
     records = []
     for kind, destination in (('main', ROOT), ('device', ROOT / 'device')):
-        for source in sorted((AUDIT / kind / 'scripts').glob('*.py')):
-            targets = [destination / 'scripts' / source.name]
+        source_scripts = AUDIT / kind / 'scripts'
+        for source in sorted(source_scripts.rglob('*.py')):
+            relative = source.relative_to(source_scripts)
+            targets = [destination / 'scripts' / relative]
             if sync:
-                targets.append(ROOT / 'out/qemu/tree/scripts' / source.name)
+                targets.append(ROOT / 'out/qemu/tree/scripts' / relative)
             for target in targets:
                 target = owned(target)
                 target.parent.mkdir(parents=True, exist_ok=True)

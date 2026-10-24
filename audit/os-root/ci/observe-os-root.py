@@ -34,6 +34,21 @@ EXPECTED = {
 }
 VALUES = tuple(EXPECTED) + ("native_legacy_stage", "native_legacy_frame_count")
 SERVICE_NAMES = {"logd", "configd", "securityd"}
+ERROR_REASONS = {
+    "path outside the dedicated project", "expected project regular file", "forbidden QEMU backend",
+    "unexpected QEMU boot parameters", "no exact private QMP socket",
+    "QMP socket is not in the project temporary directory", "QMP socket is not ready",
+    "QMP endpoint is not a socket", "disk is not a read-only project regular file",
+    "OS/SystemOS backends do not match the intended run", "unexpected firmware or ESP drive",
+    "firmware/variables/ESP path validation failed", "unexpected QEMU device list", "QEMU child is not ready",
+    "cannot identify exactly one live QEMU child for this run", "invalid QMP greeting", "QMP closed",
+    "unexpected PPM format", "unexpected framebuffer dimensions", "PPM pixel size mismatch",
+    "public output must be a new project subdirectory", "TMPDIR must be a project directory",
+    "unexpected observation source or missing regular-file adaptation", "unexpected OS raw length",
+    "preparation receipt or original launchd/raw binding mismatch", "multiple new VM run directories",
+    "VM failed to become observable", "QEMU PID identity changed", "observation budget exhausted", "timed out",
+}
+QMP_OPERATIONS = {"qmp_capabilities", "query-status", "screendump", "send-key", "input-send-event", "quit"}
 
 
 def utc():
@@ -264,6 +279,100 @@ def sanitized_log(text):
     return "\n".join(keep[-2000:]) + "\n"
 
 
+def diagnostic_text(text, project=None):
+    """Retain startup/error formats only, with no PEM, dumps or encoded payloads.
+
+    This is intentionally narrower than a general log scrubber: unmatched lines
+    are discarded. Raw traceback source lines and raw monitor replies never pass.
+    """
+    keep, pem = [], False
+    secret = re.compile(r"\b(?:api[_-]?key|access[_-]?token|github_token|password|authorization|"
+                        r"client[_-]?secret|private[_-]?key)\b", re.I)
+    for raw in text.splitlines():
+        if "-----BEGIN " in raw:
+            pem = True
+        if pem:
+            if "-----END " in raw:
+                pem = False
+            continue
+        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw).strip()
+        if not line or len(line) > 1200 or secret.search(line):
+            continue
+        if (re.search(r"(?:\b(?:0x)?[0-9a-f]{8,16}\b[ ,:\t]+){2}|"
+                      r"(?:\b[0-9a-f]{2}\b\s+){4}|"
+                      r"\b(?:registers?|machine.?code|hexdump|pmemsave)\b|\bx\d{1,2}\s*=", line, re.I)
+                or re.match(r"(?:0x)?[0-9a-f]{8,16}\s*:", line, re.I)):
+            continue
+        allowed = bool(
+            line in ERROR_REASONS
+            or line == "Traceback (most recent call last):"
+            or re.fullmatch(r'File "[^"\r\n]+", line \d+(?:, in [A-Za-z0-9_<>.]+)?', line)
+            or re.match(r"(?:qemu-system-aarch64|qemu-img|mcopy|xcrun|ld|ld64\.lld|lld|clang): ", line)
+            or re.match(r"dyld(?:\[\d+\])?: (?:Library not loaded|Symbol not found|missing symbol)", line, re.I)
+            or re.match(r"(?:Referenced from|Reason|Library not loaded): ", line)
+            or re.match(r"(?:UNIXNU|DARWINBOOT): ", line)
+            or re.fullmatch(r"qemu exit -?\d+; \d+ screenshots in .+", line)
+            or re.fullmatch(r"(?:[^ ]+ )?serial\.log has no kernel load address yet", line)
+            or re.fullmatch(r"\S+/serial\.log has no kernel load address yet", line)
+            or re.fullmatch(r"(?:" + "|".join(map(re.escape, VALUES + ("cpu_ttep", "allproc", "msgbufp")))
+                            + r") is not a kernel symbol", line)
+            or re.match(r"(?:FileNotFoundError|ConnectionRefusedError|ConnectionResetError|TimeoutError|"
+                        r"PermissionError|OSError|RuntimeError|ValueError|CalledProcessError|SystemExit): ", line)
+        )
+        if not allowed:
+            continue
+        exception_line = re.fullmatch(r"([A-Za-z]+Error|SystemExit): (.*)", line)
+        if exception_line and exception_line[1] != "CalledProcessError":
+            kind, detail = exception_line.groups()
+            errno = re.match(r"\[Errno (\d+)\]", detail)
+            if errno:
+                number = int(errno[1])
+                line = f"{kind}: errno {number}: {os.strerror(number)}"
+            elif detail not in ERROR_REASONS and not (
+                    detail.startswith("QMP command failed: ")
+                    and detail.removeprefix("QMP command failed: ") in QMP_OPERATIONS):
+                line = kind + ": exception detail withheld"
+        # Do not reproduce a CalledProcessError's argv, which may contain more
+        # than filenames in future revisions. Its numeric exit status suffices.
+        if line.startswith("CalledProcessError:"):
+            status = re.search(r"(?:exit status|returncode) (-?\d+)", line)
+            line = "CalledProcessError: child exit status " + (status[1] if status else "unavailable")
+        if project is not None:
+            line = line.replace(str(project), "$PROJECT")
+        line = re.sub(r"0x[0-9a-f]+|\b[0-9a-f]{8,}\b", "<hex>", line, flags=re.I)
+        line = re.sub(r"(?<![A-Za-z0-9_/.\\-])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9_/.\\-])",
+                      "<encoded>", line)
+        line = "".join(c for c in line if 32 <= ord(c) < 127)
+        keep.append(line)
+    return "\n".join(keep[-500:]) + ("\n" if keep else "")
+
+
+def exception_reason(exception, project):
+    """Publish a known reason, never an arbitrary exception string or repr."""
+    message = str(exception)
+    if message in ERROR_REASONS:
+        return message
+    if message.startswith("QMP command failed: ") and message.removeprefix("QMP command failed: ") in QMP_OPERATIONS:
+        return message
+    if isinstance(exception, subprocess.TimeoutExpired):
+        return "subprocess exceeded timeout (" + str(round(float(exception.timeout), 3)) + " seconds)"
+    if isinstance(exception, subprocess.CalledProcessError):
+        return "subprocess returned exit status " + str(int(exception.returncode))
+    if isinstance(exception, OSError) and isinstance(exception.errno, int):
+        reason = f"errno {exception.errno}: {os.strerror(exception.errno)}"
+        filename = exception.filename
+        if filename is not None:
+            filename = str(filename).replace(str(project), "$PROJECT")
+            if re.fullmatch(r"[A-Za-z0-9_./\\:@+() $,\[\]-]{1,400}", filename):
+                reason += "; file=" + filename
+        return reason
+    if isinstance(exception, json.JSONDecodeError):
+        return f"invalid JSON at line {exception.lineno}, column {exception.colno}"
+    if isinstance(exception, KeyboardInterrupt) and re.fullmatch(r"signal \d+", message):
+        return message
+    return "exception detail withheld; original traceback retained privately"
+
+
 def acceptance(samples):
     valid = []
     for sample in samples:
@@ -309,6 +418,7 @@ class Observer:
                         "input_steps": [], "errors": [], "publication_scope": "generated whitelist JSON and rendered PNG only"}
         self.runner = None
         self.run = None
+        self.diagnostic_run = None
         self.socket = None
         self.vm_pid = None
         self.previous_pixels = None
@@ -329,6 +439,7 @@ class Observer:
         record = {"elapsed_seconds": self.elapsed(), "code": code}
         if exception is not None:
             record["exception_type"] = type(exception).__name__
+            record["reason"] = exception_reason(exception, self.project)
             with (self.private / "observer-errors.txt").open("a") as stream:
                 stream.write(traceback.format_exc() + "\n")
         self.summary["errors"].append(record)
@@ -362,6 +473,7 @@ class Observer:
     def launch(self):
         directory = self.tree.parent / "run"
         before = set(directory.iterdir()) if directory.exists() else set()
+        self.run_parent, self.run_before = directory, before
         command = [sys.executable, str(self.tree / "scripts/run-qemu.py"), "--os-root",
                    "--os-raw-image", str(self.raw), "--accel", "tcg", "--display", "none",
                    "--screen", "firmware", "--seconds", str(self.args.seconds),
@@ -377,6 +489,8 @@ class Observer:
             new = sorted(p for p in directory.iterdir() if p not in before) if directory.exists() else []
             if len(new) > 1:
                 raise ValueError("multiple new VM run directories")
+            if new:
+                self.diagnostic_run = within(new[0], self.project)
             if new and (new[0] / "command.txt").is_file():
                 candidate = within(new[0], self.project)
                 try:
@@ -413,7 +527,12 @@ class Observer:
                                 cwd=self.tree, capture_output=True, timeout=remaining)
         raw = self.private / (label + ".txt")
         raw.write_bytes(result.stdout + b"\n--- STDERR ---\n" + result.stderr)
-        return {"exit_code": result.returncode, "raw_output_sha256": digest(raw)}, result.stdout.decode("utf-8", "replace")
+        status = {"exit_code": result.returncode, "raw_output_sha256": digest(raw)}
+        diagnostics = diagnostic_text(result.stderr.decode("utf-8", "replace") + "\n"
+                                      + result.stdout.decode("utf-8", "replace"), self.project)
+        if diagnostics:
+            status["diagnostic_excerpt"] = diagnostics.splitlines()[-6:]
+        return status, result.stdout.decode("utf-8", "replace")
 
     def sample(self):
         sample = {"elapsed_seconds": self.elapsed(), "vm_pid": self.vm_pid, "observed_utc": utc(),
@@ -595,9 +714,47 @@ class Observer:
                 path = self.run / name
                 if path.is_file():
                     self.summary[name.replace(".", "_") + "_sha256"] = digest(path)
+        try:
+            self.export_diagnostics()
+        except Exception as exc:
+            self.error("diagnostics_export_failed", exc)
         self.summary["finished_utc"] = utc()
         self.summary["total_elapsed_seconds"] = self.elapsed()
         self.save()
+
+    def export_diagnostics(self):
+        """Export only filtered text, including runs that failed before ready."""
+        candidate = self.run or self.diagnostic_run
+        if candidate is None and hasattr(self, "run_parent") and self.run_parent.exists():
+            new = [p for p in self.run_parent.iterdir() if p not in self.run_before]
+            if len(new) == 1:
+                candidate = within(new[0], self.project)
+        sources = {"runner": self.private / "runner-output.log"}
+        if candidate is not None:
+            candidate = within(candidate, self.project)
+            self.summary["diagnostic_run_relative_path"] = str(candidate.relative_to(self.project))
+            sources.update({"serial": candidate / "serial.log", "qemu": candidate / "qemu.log"})
+        records = []
+        for kind, source in sources.items():
+            if not source.is_file():
+                continue
+            source = within(source, self.project, regular=True)
+            size = source.stat().st_size
+            with source.open("rb") as stream:
+                if size > 512 * 1024:
+                    data = stream.read(256 * 1024)
+                    stream.seek(-256 * 1024, 2)
+                    data += b"\n" + stream.read()
+                else:
+                    data = stream.read()
+            filtered = diagnostic_text(data.decode("utf-8", "replace"), self.project)
+            target = self.public / ("observer-" + kind + "-diagnostic.log")
+            target.write_text("# Filtered startup/error text; raw source remains private.\n" +
+                              (filtered or "# No diagnostic lines matched the publication whitelist.\n"))
+            records.append({"file": target.name, "raw_bytes": size, "sampled_bytes": len(data),
+                            "raw_sha256": digest(source), "sanitized_sha256": digest(target),
+                            "kept_lines": len(filtered.splitlines()), "filter_version": 1})
+        self.summary["diagnostics"] = records
 
 
 def main():
