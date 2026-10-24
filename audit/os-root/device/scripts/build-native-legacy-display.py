@@ -304,6 +304,9 @@ sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'driver
          shared_window_source,metal_publish_source,accelerator_source,ROOT/'drivers/NativeMetal/OriginalAcceleratorABI.h',
          ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py']
 sources.append(refresh_observer_source)
+sources.extend([ROOT/'scripts/build-arm-driver.py',
+                ROOT/'build/native-hid-input/no-physical-buttons/NativeHidInput.cpp',
+                ROOT/'build/native-hid-input/button-provider-audit.json'])
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

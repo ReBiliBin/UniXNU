@@ -69,7 +69,8 @@ for pattern in ('archive-*.log', 'kernel*.log', 'prelink.log', 'package.log', 'p
     sources.extend(logs.glob(pattern))
 for relative in ('build/os-root-inputs.json', 'build/os-root-preparation-commands.json',
                  'build/verified-root-os/verification.json', 'build/verified-root-systemos/verification.json',
-                 'build/native-legacy-display/refresh-abi-audit.json'):
+                 'build/native-legacy-display/refresh-abi-audit.json',
+                 'build/native-hid-input/button-provider-audit.json'):
     path = ROOT / 'out/qemu/tree' / relative
     if path.is_file():
         sources.append(path)
