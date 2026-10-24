@@ -302,19 +302,158 @@ def png(ppm, target):
                        chunk(b'IDAT', zlib.compress(rows, 6)) + chunk(b'IEND', b''))
 
 
-def qmp(name, **arguments):
+def qmp(name, *, _deadline=None, **arguments):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(10)
+        def limit():
+            remaining = 10 if _deadline is None else _deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('native checkpoint observation budget exhausted')
+            s.settimeout(remaining)
+
+        limit()
         s.connect(str(sock))
         stream = s.makefile('rwb', buffering=0)
+        limit()
         stream.readline()
         for request in ({'execute': 'qmp_capabilities'}, {'execute': name, 'arguments': arguments}):
+            limit()
             stream.write((json.dumps(request) + '\n').encode())
             while True:
+                limit()
                 reply = json.loads(stream.readline())
                 if 'return' in reply or 'error' in reply:
                     break
         return reply
+
+
+def native_checkpoint_samples(addresses):
+    """Bounded native-fixture snapshots; each five-part check uses one paused VM."""
+    started = time.monotonic()
+    deadline = started + 10
+    samples, raw = [], ''
+
+    def command(name, **arguments):
+        reply = qmp(name, _deadline=deadline, **arguments)
+        if time.monotonic() > deadline:
+            raise TimeoutError('native checkpoint observation budget exhausted')
+        if 'error' in reply or 'return' not in reply:
+            raise RuntimeError('native checkpoint QMP command failed')
+        return reply['return']
+
+    for attempt in range(1, 31):
+        if time.monotonic() >= deadline:
+            break
+        sample = dict(attempt=attempt, initially_running=False, paused_confirmed=False, pc=None,
+                      checkpoint=int(addresses['_checkpoint']), el=None, getpid=None,
+                      sysctl_status=None, hw_pagesize=None, accepted=False)
+        parts, failed, stopped_by_observer = [], False, False
+        try:
+            original = command('query-status')
+            initial_status = original.get('status')
+            sample['initial_status'] = initial_status if initial_status in {
+                'running', 'paused', 'guest-panicked', 'internal-error'} else 'other'
+            if original.get('status') != 'running' or original.get('running') is not True:
+                raise RuntimeError('native checkpoint VM was not running before observation')
+            sample['initially_running'] = True
+            stopped_by_observer = True
+            command('stop')
+            status = command('query-status')
+            if status.get('status') != 'paused' or status.get('running') is not False:
+                raise RuntimeError('native checkpoint VM pause was not confirmed')
+            sample['paused_confirmed'] = True
+            for line in ('info registers', f'x /4gx {addresses["_results"]:#x}',
+                         f'x /1gx {addresses["_user_page_size"]:#x}'):
+                text = command('human-monitor-command', **{'command-line': line})
+                if not isinstance(text, str):
+                    raise ValueError('native checkpoint monitor output was not text')
+                parts.append(text)
+            registers, results, page = parts
+            pc = re.search(r'\bPC=([0-9a-fA-F]+)', registers)
+            level = re.search(r'\bEL(\d)[th]\b', registers)
+            words = [int(value, 16) for value in re.findall(r'0x([0-9a-fA-F]{16})', results)]
+            size = re.findall(r'0x([0-9a-fA-F]{16})', page)
+            sample.update(pc=int(pc[1], 16) if pc else None, el=int(level[1]) if level else None,
+                          getpid=words[0] if words else None,
+                          sysctl_status=words[1] if len(words) > 1 else None,
+                          hw_pagesize=int(size[0], 16) if size else None)
+            sample['conditions'] = dict(
+                pc_matches_fixture_checkpoint=sample['pc'] == sample['checkpoint'],
+                user_exception_level=sample['el'] == 0, pid_one=sample['getpid'] == 1,
+                sysctl_success=sample['sysctl_status'] == 0, four_kib_pages=sample['hw_pagesize'] == 4096)
+            sample['within_deadline'] = time.monotonic() <= deadline
+            sample['accepted'] = all(sample['conditions'].values()) and sample['within_deadline']
+        except Exception as error:
+            # Raw QMP/monitor replies remain private; generated JSON carries only
+            # numerical observations, booleans and a fixed Python error type.
+            sample['error_type'] = type(error).__name__
+            failed = True
+        finally:
+            raw = '\n'.join(parts)
+            if time.monotonic() > deadline:
+                sample['within_deadline'] = False
+                sample['accepted'] = False
+            sample['elapsed_seconds'] = round(time.monotonic() - started, 3)
+            samples.append(sample)
+        if sample['accepted']:
+            break  # Keep this exact state frozen until the existing quit below.
+        if stopped_by_observer and time.monotonic() < deadline:
+            try:
+                command('cont')
+                sample['resumed'] = True
+            except Exception as error:
+                sample['resume_error_type'] = type(error).__name__
+                break  # The caller still performs the normal owned-VM quit.
+        if failed or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    finished = time.monotonic()
+    if samples and finished > deadline:
+        samples[-1]['within_deadline'] = False
+        samples[-1]['accepted'] = False
+    return dict(schema=1, budget_seconds=10, maximum_attempts=30,
+                elapsed_seconds=round(finished - started, 3),
+                accepted=bool(samples and samples[-1]['accepted']), samples=samples), raw
+
+
+def native_quit_and_reap(child):
+    """Quit the owned native-test Popen child; kill and reap on any failure."""
+    result = dict(quit_attempted=False, kill_requested=False, reaped=False, failed=False)
+
+    def kill_owned_child():
+        if child.poll() is None:
+            result['kill_requested'] = True
+            try:
+                child.kill()
+            except Exception as error:
+                result['kill_error_type'] = type(error).__name__
+                result['failed'] = True
+
+    if child.poll() is None:
+        result['quit_attempted'] = True
+        try:
+            reply = qmp('quit')
+            if 'error' in reply or 'return' not in reply:
+                raise RuntimeError('native checkpoint QMP quit failed')
+        except Exception as error:
+            result['quit_error_type'] = type(error).__name__
+            result['failed'] = True
+            kill_owned_child()
+    try:
+        child.wait(timeout=30)
+        result['reaped'] = True
+    except Exception as error:
+        result['wait_error_type'] = type(error).__name__
+        result['failed'] = True
+        kill_owned_child()
+        try:
+            child.wait(timeout=5)
+            result['reaped'] = True
+        except Exception as reap_error:
+            result['reap_error_type'] = type(reap_error).__name__
+    result['exit_code'] = child.returncode
+    if child.returncode != 0 or not result['reaped']:
+        result['failed'] = True
+    return result
 
 
 start, shots = time.time(), []
@@ -329,32 +468,36 @@ while time.time() - start < args.seconds and process.poll() is None:
             png(ppm, shots[-1])
     except OSError as error:
         print('screendump failed:', error)
+native_observation = None
 if args.native_user and process.poll() is None:
-    # Where the CPU is and what the test process stored: getpid() of the first process is 1, and hw.pagesize is
-    # 4096 on the native 4 KiB user ABI. QEMU's "x" reads virtual addresses through the current translation.
+    # A single terminal live-PC sample may land in the kernel. Retry only within
+    # this fixed native-fixture window; all original checkpoint criteria remain.
     addresses = json.loads((fixture / 'addresses.json').read_text())
-
-    def hmp(line):
-        reply = qmp('human-monitor-command', **{'command-line': line})
-        return reply.get('return', json.dumps(reply.get('error')))
-
-    registers = hmp('info registers')
-    results = hmp(f'x /4gx {addresses["_results"]:#x}')
-    page = hmp(f'x /1gx {addresses["_user_page_size"]:#x}')
-    (out / 'native-user.txt').write_text(registers + '\n' + results + '\n' + page)
-    pc = re.search(r'\bPC=([0-9a-f]+)', registers)
-    level = re.search(r'\bEL(\d)[th]\b', registers)
-    words = [int(value, 16) for value in re.findall(r'0x([0-9a-f]{16})', results)]
-    size = re.findall(r'0x([0-9a-f]{16})', page)
-    print(f'native user: PC {pc.group(1) if pc else "?"} (checkpoint {addresses["_checkpoint"]:x}), '
-          f'EL{level.group(1) if level else "?"}, getpid {words[0] if words else "?"}, '
-          f'sysctl status {words[1] if len(words) > 1 else "?"}, hw.pagesize {int(size[0], 16) if size else "?"}')
-if process.poll() is None:
-    try:
-        qmp('quit')
-    except OSError:
-        process.kill()
-process.wait(timeout=30)
+    observation, raw = native_checkpoint_samples(addresses)
+    native_observation = observation
+    (out / 'native-checkpoint-samples.json').write_text(json.dumps(observation, indent=2) + '\n')
+    (out / 'native-user.txt').write_text(raw)
+    last = observation['samples'][-1] if observation['samples'] else {}
+    pc = f'{last["pc"]:x}' if last.get('pc') is not None else '?'
+    observed = lambda name: last.get(name) if last.get(name) is not None else '?'
+    print(f'native user: PC {pc} (checkpoint {addresses["_checkpoint"]:x}), '
+          f'EL{observed("el")}, getpid {observed("getpid")}, '
+          f'sysctl status {observed("sysctl_status")}, hw.pagesize {observed("hw_pagesize")}')
+if args.native_user:
+    native_termination = native_quit_and_reap(process)
+    native_observation = native_observation or dict(schema=1, accepted=False, samples=[])
+    native_observation['termination'] = native_termination
+    if native_termination['failed']:
+        native_observation['accepted'] = False
+    (out / 'native-checkpoint-samples.json').write_text(json.dumps(native_observation, indent=2) + '\n')
+    print('native checkpoint accepted: ' + str(native_observation['accepted']).lower())
+else:
+    if process.poll() is None:
+        try:
+            qmp('quit')
+        except OSError:
+            process.kill()
+    process.wait(timeout=30)
 shutil.rmtree(work, ignore_errors=True)
 for host in hosts:
     host.terminate()
@@ -371,6 +514,8 @@ if shots:
     qemu_exit=process.returncode, screenshots=[str(path) for path in shots],
     elapsed_seconds=round(time.time() - start, 3), requested_seconds=args.seconds,
     scope='QEMU lifecycle only; original-userland/UI acceptance requires separate live observations'), indent=2) + '\n')
+if args.native_user and native_termination['failed']:
+    raise SystemExit(1)
 if process.returncode != 0:
     raise SystemExit(process.returncode if 0 < process.returncode < 256 else 1)
 

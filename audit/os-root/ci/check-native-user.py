@@ -15,12 +15,14 @@ pc, checkpoint = (int(value, 16) for value in match.group(1, 2))
 el, pid, status, page_size = (int(value) for value in match.group(3, 4, 5, 6))
 addresses = json.loads(Path("out/qemu/tree/build/native-user-fixture/addresses.json").read_text())
 expected = int(addresses["_checkpoint"])
+markers = re.findall(r"^native checkpoint accepted: (.*)$", log, flags=re.M)
 conditions = {
     "pc_matches_fixture_checkpoint": pc == checkpoint == expected,
     "user_exception_level": el == 0,
     "pid_one": pid == 1,
     "sysctl_success": status == 0,
     "four_kib_pages": page_size == 4096,
+    "coherent_bounded_snapshot": markers == ["true"],
 }
 record = {
     "result": "PASS" if all(conditions.values()) else "FAIL",

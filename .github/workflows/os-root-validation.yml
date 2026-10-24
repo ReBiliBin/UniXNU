@@ -81,6 +81,19 @@ jobs:
         timeout-minutes: 3
         run: python3 audit/os-root/ci/probe-qemu-startup.py
 
+      - name: Preserve host diagnostics before compiling
+        run: |
+          python3 audit/os-root/ci/ci-util.py resource --label before-kernel
+          python3 audit/os-root/ci/collect-public.py
+
+      - name: Upload host diagnostics before compiling
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: unixnu-os-root-host-${{ github.run_attempt }}
+          path: public-logs/
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Build source XNU baseline and exact PMGR bindings
         id: baseline_kernel
         timeout-minutes: 45
@@ -110,19 +123,22 @@ jobs:
           ./unixnu build package payload --unique-chip-id 0123456789abcdef
           python3 audit/os-root/ci/ci-util.py sync
 
-      - name: Verify real native-user baseline on Intel host
-        id: native_user
+      - name: Run real native-user baseline on Intel host
+        id: native_run
         timeout-minutes: 15
         run: |
           export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
           /usr/bin/time -l python3 out/qemu/tree/scripts/run-qemu.py \
             --native-user --accel tcg --display none --screen firmware \
             --seconds 300 --every 60 2>&1 | tee out/qemu/logs/native-user-run.log
-          python3 audit/os-root/ci/check-native-user.py
           mkdir -p audit-runtime/native-baseline
-          cp out/qemu/logs/native-user-check.log audit-runtime/native-baseline/
           shasum -a 256 out/qemu/kernel/kernel.macho out/qemu/tree/build/native-user-fixture/addresses.json \
             > audit-runtime/native-baseline/artifact-hashes.txt
+
+      - name: Check strict native-user checkpoint
+        id: native_user
+        continue-on-error: true
+        run: python3 audit/os-root/ci/check-native-user.py
 
       - name: Prepare complete original-system input
         id: os_input
@@ -222,3 +238,14 @@ jobs:
             echo 'A green job or process name alone is not a successful iPadOS/UI verdict. Review evidence and rendered screenshots.'
             echo 'Only project files and synthetic virtual input; no phone operations. No OS/kernel/payload/private-key/RAM artifacts.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require both independently tested stages to pass
+        if: always()
+        env:
+          NATIVE: ${{ steps.native_user.outcome }}
+          ORIGINAL_OS: ${{ steps.os_observe.outcome }}
+        run: |
+          if [ "$NATIVE" != success ] || [ "$ORIGINAL_OS" != success ]; then
+            echo 'One or more independently tested stages did not pass; review their separate evidence.'
+            exit 1
+          fi

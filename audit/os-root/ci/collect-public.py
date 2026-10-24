@@ -76,6 +76,7 @@ logs = ROOT / 'out/qemu/logs'
 for pattern in ('archive-*.log', 'kernel*.log', 'prelink.log', 'package.log', 'payload-*.log',
                 'storage-headers.log', 'native-user-run.log', 'native-user-check.log', 'os-root-prepare.log'):
     sources.extend(logs.glob(pattern))
+sources.extend((ROOT / 'out/qemu/run').glob('*/native-checkpoint-samples.json'))
 for relative in ('build/os-root-inputs.json', 'build/os-root-preparation-commands.json',
                  'build/verified-root-os/verification.json', 'build/verified-root-systemos/verification.json',
                  'build/native-legacy-display/refresh-abi-audit.json',
