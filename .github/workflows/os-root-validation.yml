@@ -64,6 +64,9 @@ jobs:
           make --version | head -n 1
           "$(brew --prefix make)/bin/gmake" --version | head -n 1
           python3 audit/os-root/ci/check-host-make.py
+          python3 audit/os-root/main/scripts/prepare-owner-os-raw.py --check-tools \
+            > audit-runtime/hdiutil-identity.json
+          cat audit-runtime/hdiutil-identity.json
           if ! command -v unifdef >/dev/null; then
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
