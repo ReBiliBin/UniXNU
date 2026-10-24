@@ -60,7 +60,10 @@ jobs:
         timeout-minutes: 15
         run: |
           python3 audit/os-root/ci/ci-util.py resource --label initial
-          brew install llvm lld qemu mtools dtc openssl@3
+          brew install llvm lld qemu mtools dtc openssl@3 make
+          make --version | head -n 1
+          "$(brew --prefix make)/bin/gmake" --version | head -n 1
+          python3 audit/os-root/ci/check-host-make.py
           if ! command -v unifdef >/dev/null; then
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
@@ -93,7 +96,8 @@ jobs:
         id: baseline_payload
         timeout-minutes: 20
         run: |
-          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          export PATH="$(brew --prefix make)/libexec/gnubin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          python3 audit/os-root/ci/check-host-make.py --require-active
           font_dir="$UNIXNU_UEFI/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib"
           mkdir -p "$font_dir"
           curl -fsSL --retry 3 --max-time 90 \
@@ -131,7 +135,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          export PATH="$(brew --prefix make)/libexec/gnubin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
           ./unixnu ipsw fetch
           python3 audit/os-root/ci/ci-util.py sync
           /usr/bin/time -l bash -c 'cd out/qemu/tree && python3 scripts/build-os-root.py \
@@ -152,7 +156,7 @@ jobs:
           python3 audit/os-root/ci/ci-util.py sync
           ./unixnu build kernel
           grep -F 'PASS: ordinary ARM64/iOS17 build; exact native and original bindings' out/qemu/logs/archive-10-build-platform-power.log
-          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          export PATH="$(brew --prefix make)/libexec/gnubin:$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
           ./unixnu build payload --unique-chip-id 0123456789abcdef \
             --trust-cache out/qemu/tree/build/original-static-system-trust/original-static-system.bundle \
             --data-ramdisk out/qemu/tree/.cache/firmware/owner-data/owner-data-1g.dbr

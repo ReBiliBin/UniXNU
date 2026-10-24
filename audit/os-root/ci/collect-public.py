@@ -60,7 +60,7 @@ def clean(text):
 sources = []
 runtime = ROOT / 'audit-runtime'
 for pattern in ('resources-*.json', 'source-identity.json', 'patch-install-*.json', 'ipsw-input.json',
-                'qemu-startup-probe.json', 'native-baseline/*.log', 'native-baseline/*.txt'):
+                'qemu-startup-probe.json', 'host-make-*.json', 'native-baseline/*.log', 'native-baseline/*.txt'):
     sources.extend(runtime.glob(pattern))
 logs = ROOT / 'out/qemu/logs'
 for pattern in ('archive-*.log', 'kernel*.log', 'prelink.log', 'package.log', 'payload-*.log',
