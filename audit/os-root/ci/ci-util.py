@@ -72,11 +72,17 @@ def resource(label):
               'platform': platform.platform(), 'machine': platform.machine(),
               'memory_bytes': memory, 'disk_free_bytes': shutil.disk_usage(ROOT).free,
               'cpu_count': os.cpu_count(), 'uid': os.getuid()}
+    record['load_average'] = os.getloadavg()
+    try:
+        vm = subprocess.run(['vm_stat'], capture_output=True, text=True, timeout=10)
+        record['host_vm_stat'] = {'exit_code': vm.returncode, 'counters': vm.stdout[:8000]}
+    except (OSError, subprocess.SubprocessError) as error:
+        record['host_vm_stat'] = {'unavailable': type(error).__name__}
     save('resources-' + label + '.json', record)
     print(json.dumps(record), flush=True)
     if memory < 12 * 2**30:
         raise RuntimeError('This experiment requires a host with at least 12 GiB RAM')
-    minimum_gib = 10 if label == 'after-os-prepare' else 30
+    minimum_gib = 10 if label in ('after-os-prepare', 'before-os-observe') else 30
     if record['disk_free_bytes'] < minimum_gib * 2**30:
         raise RuntimeError(f'Less than {minimum_gib} GiB free for the remaining experiment')
 

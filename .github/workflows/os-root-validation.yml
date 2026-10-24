@@ -165,12 +165,29 @@ jobs:
             --data-ramdisk out/qemu/tree/.cache/firmware/owner-data/owner-data-1g.dbr
           python3 audit/os-root/ci/ci-util.py sync
 
+      - name: Preserve allowed build evidence before boot
+        run: |
+          python3 audit/os-root/ci/ci-util.py resource --label before-os-observe
+          python3 audit/os-root/ci/collect-public.py
+
+      - name: Upload text evidence before boot
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: unixnu-os-root-preboot-${{ github.run_attempt }}
+          path: public-logs/
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Observe original launchd, services, display and input
         id: os_observe
-        timeout-minutes: 25
+        timeout-minutes: 40
         run: |
           export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
-          /usr/bin/time -l python3 audit/os-root/ci/observe-os-root.py \
+          /usr/bin/time -l python3 audit/os-root/ci/supervise-os-root.py \
+            --project-root "$GITHUB_WORKSPACE" \
+            --observer "$GITHUB_WORKSPACE/audit/os-root/ci/observe-os-root.py" \
+            --summary "$GITHUB_WORKSPACE/audit-runtime/os-root-supervisor.json" \
+            --wall-seconds 1800 --grace-seconds 60 -- \
             --project-root "$GITHUB_WORKSPACE" --tree "$GITHUB_WORKSPACE/out/qemu/tree" \
             --os-raw-image "$GITHUB_WORKSPACE/device/.cache/firmware/target-volumes/os-virtual-media.cdr" \
             --public-dir "$GITHUB_WORKSPACE/public-logs/evidence" --seconds 900 --every 60

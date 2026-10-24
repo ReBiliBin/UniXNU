@@ -8,8 +8,17 @@ import re
 
 ROOT = Path(os.environ['GITHUB_WORKSPACE']).resolve()
 DEST = ROOT / 'public-logs'
+if DEST.is_symlink() or not DEST.resolve().is_relative_to(ROOT):
+    raise RuntimeError('Public diagnostics must remain a real project directory')
 DEST.mkdir(exist_ok=True)
+# Rebuild this generated manifest when collecting a preboot and final snapshot.
+manifest_path = DEST / 'evidence-manifest.json'
+if manifest_path.is_symlink():
+    raise RuntimeError('The generated manifest may not be a symlink')
+manifest_path.unlink(missing_ok=True)
 TEXT = DEST / 'build-text'
+if TEXT.is_symlink():
+    raise RuntimeError('Build diagnostics may not be a symlink')
 TEXT.mkdir(exist_ok=True)
 manifest = []
 
@@ -60,7 +69,7 @@ def clean(text):
 sources = []
 runtime = ROOT / 'audit-runtime'
 for pattern in ('resources-*.json', 'source-identity.json', 'patch-install-*.json', 'ipsw-input.json',
-                'qemu-startup-probe.json', 'host-make-*.json', 'hdiutil-identity.json',
+                'qemu-startup-probe.json', 'host-make-*.json', 'hdiutil-identity.json', 'os-root-supervisor.json',
                 'native-baseline/*.log', 'native-baseline/*.txt'):
     sources.extend(runtime.glob(pattern))
 logs = ROOT / 'out/qemu/logs'
@@ -102,6 +111,8 @@ for path in sources:
         continue
     name = str(path.relative_to(ROOT)).replace('/', '__').replace('\\', '__') + '.log'
     target = TEXT / name
+    if target.is_symlink():
+        raise RuntimeError('Diagnostic output may not overwrite a symlink')
     target.write_text(text, encoding='utf-8')
 
 # The observer owns its explicit report schema. Validate every staged entry,

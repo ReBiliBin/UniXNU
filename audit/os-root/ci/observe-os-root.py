@@ -23,7 +23,7 @@ import traceback
 import zlib
 
 DEVICE_PIN = "97b75b1f63c6b7e895cd7646029db741d5fe5488"
-PS_BLOB = "0a95a191b401a98173fc1a9ca33a519b202d52d2"
+PS_BLOB = "f505c43b2bfcf14cc2a3dca5a2a80eeb8d57f301"
 LAUNCHD_SHA = "8cec9a3c44a443b08e977ccc5d577850316ad428c575dc01f09b018dbd5b6a25"
 EXPECTED = {
     "native_owner_root_accepted": 1, "native_owner_root_decision": 1,
@@ -35,6 +35,11 @@ EXPECTED = {
 VALUES = tuple(EXPECTED) + ("native_legacy_stage", "native_legacy_frame_count")
 SERVICE_NAMES = {"logd", "configd", "securityd"}
 ERROR_REASONS = {
+    "kernel log unavailable: invalid msgbuf pointer",
+    "kernel log unavailable: invalid msgbuf magic",
+    "kernel log unavailable: ring size exceeds collector bounds",
+    "kernel log unavailable: invalid ring write index",
+    "kernel log unavailable: invalid ring pointer",
     "path outside the dedicated project", "expected project regular file", "forbidden QEMU backend",
     "unexpected QEMU boot parameters", "no exact private QMP socket",
     "QMP socket is not in the project temporary directory", "QMP socket is not ready",
@@ -536,7 +541,8 @@ class Observer:
 
     def sample(self):
         sample = {"elapsed_seconds": self.elapsed(), "vm_pid": self.vm_pid, "observed_utc": utc(),
-                  "processes": [], "values": {}, "commands": {}}
+                  "processes": [], "values": {}, "commands": {},
+                  "kernel_log_available": False, "panic_text_seen": None}
         label = f"sample-{len(self.summary['samples']):03d}"
         for kind in ("processes", "values", "log"):
             try:
@@ -554,7 +560,8 @@ class Observer:
                     sample["processes"] = parse_procs(text)
                 elif kind == "values":
                     sample["values"] = parse_values(text)
-                elif kind == "log" and log.is_file():
+                elif kind == "log" and status["exit_code"] == 0 and log.is_file():
+                    sample["kernel_log_available"] = True
                     sample["kernel_log_sha256"] = digest(log)
                     kernel = log.read_text(errors="replace")
                     sample["panic_text_seen"] = bool(re.search(r"panic\(cpu|panicString|Kernel panic", kernel, re.I))
