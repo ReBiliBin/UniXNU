@@ -2,11 +2,6 @@ name: QEMU original iPadOS validation
 
 on:
   workflow_dispatch:
-  push:
-    branches: [codex/validate-os-root-20261024]
-    paths:
-      - .github/workflows/os-root-validation.yml
-      - audit/os-root/**
 
 permissions:
   contents: read
