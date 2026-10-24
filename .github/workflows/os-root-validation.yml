@@ -1,0 +1,196 @@
+name: QEMU original iPadOS validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/validate-os-root-20261024]
+    paths:
+      - .github/workflows/os-root-validation.yml
+      - audit/os-root/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qemu-os-root-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  UNIXNU_DEVICE: ${{ github.workspace }}/device
+  UNIXNU_AUDIT_PROJECT_ROOT: ${{ github.workspace }}
+  UNIXNU_QEMU_ACCEL: tcg
+  UNIXNU_UEFI: ${{ github.workspace }}/qemu-font
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  os-root:
+    runs-on: macos-26-intel
+    timeout-minutes: 240
+    steps:
+      - name: Check out the isolated experiment
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Prepare project temporary directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.q" audit-runtime
+          echo "TMPDIR=$GITHUB_WORKSPACE/.q" >> "$GITHUB_ENV"
+
+      - name: Check out fixed QEMU board
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: xVanTuring/UniXNU-qemu
+          ref: 97b75b1f63c6b7e895cd7646029db741d5fe5488
+          path: device
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+
+      - name: Record resources and install host tools
+        timeout-minutes: 15
+        run: |
+          python3 audit/os-root/ci/ci-util.py resource --label initial
+          brew install llvm lld qemu mtools dtc openssl@3
+          if ! command -v unifdef >/dev/null; then
+            brew install unifdef
+            echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          fi
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          qemu-system-aarch64 --version
+          python3 audit/os-root/ci/ci-util.py install
+
+      - name: Build source XNU baseline and exact PMGR bindings
+        id: baseline_kernel
+        timeout-minutes: 45
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./unixnu defconfig qemu_defconfig
+          printf '\nCONFIG_XNU_BUILD_ARCHIVES=y\n' >> out/qemu/.config
+          ./unixnu build kernel
+          python3 audit/os-root/ci/ci-util.py sync
+          ./unixnu build kernel
+          grep -F 'PASS: ordinary ARM64/iOS17 build; exact native and original bindings' out/qemu/logs/archive-10-build-platform-power.log
+          python3 audit/os-root/ci/ci-util.py sync
+
+      - name: Build QEMU firmware and baseline payload
+        id: baseline_payload
+        timeout-minutes: 20
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          font_dir="$UNIXNU_UEFI/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib"
+          mkdir -p "$font_dir"
+          curl -fsSL --retry 3 --max-time 90 \
+            https://raw.githubusercontent.com/UniXNU/uefi-sheng/0eb4514db0744b8136a3897ab1af93b713c2c27b/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h \
+            -o "$font_dir/Font.h"
+          test "$(git hash-object "$font_dir/Font.h")" = 2ea15a28fe1ad2ddddf1cbbac766aeceb9243183
+          ./unixnu build package payload --unique-chip-id 0123456789abcdef
+          python3 audit/os-root/ci/ci-util.py sync
+
+      - name: Verify real native-user baseline on Intel host
+        id: native_user
+        timeout-minutes: 15
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          /usr/bin/time -l python3 out/qemu/tree/scripts/run-qemu.py \
+            --native-user --accel tcg --display none --screen firmware \
+            --seconds 300 --every 60 2>&1 | tee out/qemu/logs/native-user-run.log
+          python3 audit/os-root/ci/check-native-user.py
+          mkdir -p audit-runtime/native-baseline
+          cp out/qemu/logs/native-user-check.log audit-runtime/native-baseline/
+          shasum -a 256 out/qemu/kernel/kernel.macho out/qemu/tree/build/native-user-fixture/addresses.json \
+            > audit-runtime/native-baseline/artifact-hashes.txt
+
+      - name: Prepare complete original-system input
+        id: os_input
+        timeout-minutes: 50
+        run: |
+          python3 audit/os-root/ci/ci-util.py resource --label before-os-download
+          python3 audit/os-root/ci/ci-util.py download
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Prepare verified-root policies, original trust and virtual Data
+        id: os_prepare
+        timeout-minutes: 110
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          ./unixnu ipsw fetch
+          python3 audit/os-root/ci/ci-util.py sync
+          /usr/bin/time -l bash -c 'cd out/qemu/tree && python3 scripts/build-os-root.py \
+            --ipsw "$UNIXNU_IPSW" --openssl-prefix "$(brew --prefix openssl@3)" \
+            --os-raw-image "$GITHUB_WORKSPACE/device/.cache/firmware/target-volumes/os-virtual-media.cdr"' \
+            2>&1 | tee out/qemu/logs/os-root-prepare.log
+          python3 audit/os-root/ci/ci-util.py resource --label after-os-prepare
+
+      - name: Build source verified-root kernel and payload
+        id: os_payload
+        timeout-minutes: 45
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          export XNU_OWNER_DATA_VOLUME_UUID="$(python3 -c 'import json; print(json.load(open("out/qemu/tree/.cache/firmware/owner-data/seed.json"))["volume_uuid"])')"
+          ./unixnu defconfig qemu_root_defconfig
+          printf '\nCONFIG_XNU_BUILD_ARCHIVES=y\n' >> out/qemu/.config
+          python3 audit/os-root/ci/ci-util.py sync
+          ./unixnu build kernel
+          grep -F 'PASS: ordinary ARM64/iOS17 build; exact native and original bindings' out/qemu/logs/archive-10-build-platform-power.log
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          ./unixnu build payload --unique-chip-id 0123456789abcdef \
+            --trust-cache out/qemu/tree/build/original-static-system-trust/original-static-system.bundle \
+            --data-ramdisk out/qemu/tree/.cache/firmware/owner-data/owner-data-1g.dbr
+          python3 audit/os-root/ci/ci-util.py sync
+
+      - name: Observe original launchd, services, display and input
+        id: os_observe
+        timeout-minutes: 25
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
+          /usr/bin/time -l python3 audit/os-root/ci/observe-os-root.py \
+            --project-root "$GITHUB_WORKSPACE" --tree "$GITHUB_WORKSPACE/out/qemu/tree" \
+            --os-raw-image "$GITHUB_WORKSPACE/device/.cache/firmware/target-volumes/os-virtual-media.cdr" \
+            --public-dir "$GITHUB_WORKSPACE/public-logs/evidence" --seconds 900 --every 60
+
+      - name: Collect allowed diagnostic evidence
+        if: always()
+        run: python3 audit/os-root/ci/collect-public.py
+
+      - name: Upload text and rendered screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: unixnu-os-root-evidence-${{ github.run_attempt }}
+          path: public-logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        env:
+          BASELINE: ${{ steps.native_user.outcome }}
+          PREPARATION: ${{ steps.os_prepare.outcome }}
+          PAYLOAD: ${{ steps.os_payload.outcome }}
+          OBSERVATION: ${{ steps.os_observe.outcome }}
+        run: |
+          {
+            echo '## Isolated QEMU original-userland experiment'
+            echo "Native baseline: $BASELINE"
+            echo "OS preparation: $PREPARATION"
+            echo "Root payload: $PAYLOAD"
+            echo "Observation: $OBSERVATION"
+            echo 'A green job or process name alone is not a successful iPadOS/UI verdict. Review evidence and rendered screenshots.'
+            echo 'Only project files and synthetic virtual input; no phone operations. No OS/kernel/payload/private-key/RAM artifacts.'
+          } >> "$GITHUB_STEP_SUMMARY"
